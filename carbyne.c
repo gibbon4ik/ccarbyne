@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 
 #include "common.h"
@@ -67,6 +68,7 @@ struct net_addr remote_addr;
 
 int interval = 60;
 uint8_t use_tcp = 0;
+int carbon_timeout = 3;
 
 volatile uint64_t getmetrics = 0;
 volatile uint64_t errmetrics = 0;
@@ -148,23 +150,53 @@ void add_point(struct st *st, char *key, double value, unsigned long long tm, un
 
 int sock()
 {
-	int fd;
+	int fd, flags, r;
+	fd_set	fds;
+	struct timeval tv;
+	socklen_t len;
+
 	int socktype = use_tcp ? SOCK_STREAM : SOCK_DGRAM;
 
+
 	if ((fd = socket(AF_INET, socktype, 0)) == -1) {
-		PFATAL("socket");
+		PFATAL("carbon socket");
 	}
 
-	/*
-	int nonblock = 1;
-	if (ioctl(fd, FIONBIO, &nonblock) < 0) {
-		PFATAL("ioctl");
+	if ((flags = fcntl(fd, F_GETFL, 0)) < 0) {
+		PFATAL("fcntl");
 	}
-	*/
+
+	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		PFATAL("fcntl");
+	}
+
 	if (connect(fd, remote_addr.sockaddr, remote_addr.sockaddr_len) < 0) {
 		if (errno != EINPROGRESS) {
 			PFATAL("connect");
 		}
+
+		/* Wait for connection. */
+		tv.tv_sec = carbon_timeout;
+		tv.tv_usec = 0;
+		FD_ZERO(&fds);
+		FD_SET(fd, &fds);
+		if ((r = select(fd + 1, NULL, &fds, NULL, &tv)) != 1) {
+			close(fd);
+			return -1;
+		}
+		len = sizeof(r);
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &r, &len) == -1)
+			FATAL("getsockopt");
+		if (r) {
+			close(fd);
+			ERRORF("carbon connect error: %s\n", strerror(r));
+			return -1;
+		}
+
+		if (fcntl(fd, F_SETFL, flags) < 0) {
+			PFATAL("fcntl");
+		}
+
 	}
 	net_set_buffer_size(fd, SNDBUF_SIZE, 1);
 	return fd;
@@ -195,7 +227,7 @@ void flush(struct obuf *o)
 				continue;
 			}
 			if (use_tcp) {
-				ERRORF("error: tcp send [%d]\n", errno);
+				ERRORF("error: carbon tcp send [%d]\n", errno);
 				close(o->fd);
 				o->fd = -1;
 			}
@@ -384,8 +416,6 @@ int main(int argc, char *argv[])
 	const char *remote_addr_str = "127.0.0.1:2003";
 	const char *stat_addr_str = NULL;
 	struct net_addr stat_addr;
-	fd_set active_fd_set, read_fd_set;
-	char buffer[1000];
 	int stat_fd = -1;
 	int thread_num = 1;
 	char *progname = argv[0];
@@ -478,6 +508,9 @@ usage: %s options\n\
 	}
 
 	/* Initialize the set of active sockets. */
+	fd_set active_fd_set, read_fd_set;
+	char buffer[1000];
+
 	FD_ZERO (&active_fd_set);
 	if (stat_addr_str != NULL) {
 		parse_addr(&stat_addr, stat_addr_str);
@@ -489,13 +522,11 @@ usage: %s options\n\
 		FD_SET (stat_fd, &active_fd_set);
 	}
 
-	struct timeval timeout =
-		NSEC_TIMEVAL(MSEC_NSEC(1000UL));
-
 	while (1) {
+		struct timeval timeout =
+			NSEC_TIMEVAL(MSEC_NSEC(1000UL));
 		read_fd_set = active_fd_set;
-
-		int r = select(FD_SETSIZE, &read_fd_set, NULL, NULL, &timeout);
+		int r = select(stat_fd+1, &read_fd_set, NULL, NULL, &timeout);
 		if (r < 0) {
 			PFATAL("select()");
 		}
@@ -504,7 +535,7 @@ usage: %s options\n\
 		}
 
 		/* Service all the sockets with input pending. */
-		for (i = 0; i < FD_SETSIZE; ++i) {
+		for (i = 0; i < stat_fd+1; ++i) {
 			if (FD_ISSET (i, &read_fd_set)) {
 				if (i == stat_fd) {
 					/* Connection request on original socket. */
@@ -513,25 +544,24 @@ usage: %s options\n\
 					struct sockaddr_in clientname;
 					socklen_t size;
 
-					size = sizeof (clientname);
-					new = accept (stat_fd,
+					size = sizeof(clientname);
+					new = accept(stat_fd,
 							(struct sockaddr *) &clientname,
 							&size);
 					if (new < 0) {
-						perror ("accept");
-						exit (EXIT_FAILURE);
+						ERRORF("statistic connect accept error\n");
 					}
-					FD_SET (new, &active_fd_set);
-					int len = sprintf(buffer, "metrics\t%lu\nerrors\t%lu\nsend\t%lu\n",
-							__atomic_load_n(&getmetrics, 0),
-							__atomic_load_n(&errmetrics, 0),
-							__atomic_load_n(&sendmetrics, 0));
-					r = write(new, buffer, len);
-					if (r < 0) {
-						// ERRORF("write");
+					else {
+						int len = sprintf(buffer, "metrics\t%lu\nerrors\t%lu\nsend\t%lu\n",
+								__atomic_load_n(&getmetrics, 0),
+								__atomic_load_n(&errmetrics, 0),
+								__atomic_load_n(&sendmetrics, 0));
+						r = write(new, buffer, len);
+						if (r < 0) {
+							ERRORF("statistic write error\n");
+						}
+						close (new);
 					}
-					close (new);
-					FD_CLR (new, &active_fd_set);
 				}
 			}
 		}
