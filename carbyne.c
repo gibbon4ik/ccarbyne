@@ -22,7 +22,7 @@
 #define MAX_MSG 64
 #define STQUEUE_MAX 64
 
-#define PROGNAME "ccarbyne v0.2"
+#define PROGNAME "ccarbyne v0.3"
 #define RCVBUF_SIZE (1024*1024)
 #define SNDBUF_SIZE (256*1024)
 
@@ -68,6 +68,7 @@ struct net_addr remote_addr;
 
 int interval = 60;
 uint8_t use_tcp = 0;
+uint8_t cascade = 0;
 int carbon_timeout = 3;
 
 volatile uint64_t getmetrics = 0;
@@ -239,7 +240,7 @@ void flush(struct obuf *o)
 	} while (o->len > 0);
 }
 
-void xmit(struct obuf *o, const char *metric, double value, unsigned long long tm)
+void xmit_value(struct obuf *o, const char *metric, double value, unsigned long long tm)
 {
 	const int packet_len = use_tcp ? OBUF_LEN : CARBON_LEN;
 	int r = 0;
@@ -247,6 +248,23 @@ again:
 	r = snprintf(o->buf + o->len, packet_len - o->len + 1,
 		     "%s %f %llu\n",
 		     metric, value, tm);
+
+	assert(r < CARBON_LEN);
+	if (r > packet_len - o->len) {
+		flush(o);
+		goto again;
+	}
+	o->len += r;
+}
+
+void xmit_cascade(struct obuf *o, const char *metric, double sum, unsigned int count, unsigned long long tm)
+{
+	const int packet_len = use_tcp ? OBUF_LEN : CARBON_LEN;
+	int r = 0;
+again:
+	r = snprintf(o->buf + o->len, packet_len - o->len + 1,
+		     "%s %f %llu %u\n",
+		     metric, sum, tm, count);
 
 	assert(r < CARBON_LEN);
 	if (r > packet_len - o->len) {
@@ -272,10 +290,16 @@ void dumper(struct st *st, struct obuf *o)
 	mh_foreach(_pt, h, i) {
 		struct point *pt = mh_pt_value(h, i);
 
+		if (cascade) {
+			xmit_cascade(o, pt->key, pt->value, pt->count, pt->tm);
+			__atomic_fetch_add(&sendmetrics, 1, 0);
+			continue;
+		}
+
 		pt->tm /= pt->count;
 
 		if (strstr(pt->key, ".count.") != NULL) {
-			xmit(o, pt->key, pt->value, pt->tm);
+			xmit_value(o, pt->key, pt->value, pt->tm);
 			__atomic_fetch_add(&sendmetrics, 1, 0);
 			strcpy(kbuf, pt->key);
 			char *rpoint = strrchr(kbuf, '.');
@@ -285,7 +309,7 @@ void dumper(struct st *st, struct obuf *o)
 			}
 		}
 		if (strstr(pt->key, ".avg.") != NULL) {
-			xmit(o, pt->key, pt->value / pt->count, pt->tm);
+			xmit_value(o, pt->key, pt->value / pt->count, pt->tm);
 			__atomic_fetch_add(&sendmetrics, 1, 0);
 		}
 	}
@@ -294,7 +318,7 @@ void dumper(struct st *st, struct obuf *o)
 	mh_foreach(_pt, h, i) {
 		struct point *pt = mh_pt_value(h, i);
 		pt->tm /= pt->count;
-		xmit(o, pt->key, pt->value, pt->tm);
+		xmit_value(o, pt->key, pt->value, pt->tm);
 		__atomic_fetch_add(&sendmetrics, 1, 0);
 	}
 
@@ -326,17 +350,22 @@ void aggregator_loop(void *userdata) {
 	static __thread struct mh_pt_t *h;
 
 	struct obuf *o = malloc(sizeof(*o));
-	o->fd = - 1;
+	o->fd  = - 1;
 	o->len = 0;
 
 	total = st_create();
 	time_t nextdump = (time(NULL) / interval) * interval + interval;
+	struct timespec tv;
+	// delay dump by 0.01s
+	long   dumpdelay = cascade ? 0 : 1e7;
 
 	while (1) {
 		st = stq_pop();
 		if (st == NULL) {
-			if (time(NULL) >= nextdump) {
-				nextdump = time(NULL) + interval;
+			clock_gettime(CLOCK_REALTIME, &tv);
+			// delay dump by 0.01s
+			if (tv.tv_sec > nextdump || (tv.tv_sec == nextdump && tv.tv_nsec >= dumpdelay)) {
+				nextdump += interval;
 				dumper(total, o);
 				total = st_create();
 			}
@@ -364,7 +393,7 @@ void listener_loop(void *userdata)
 
 	while (1) {
 		if (time(NULL) >= nextsec) {
-			nextsec = time(NULL) + 1;
+			nextsec += 1;
 			if (stq_push(map))
 				map = st_create();
 		}
@@ -394,6 +423,7 @@ void listener_loop(void *userdata)
 				char *key = strtok_r(line, " ", &save2);
 				char *value = strtok_r(NULL, " ", &save2);
 				char *time = strtok_r(NULL, " ", &save2);
+				char *count = strtok_r(NULL, " ", &save2);
 
 				if (!key || !value || !time) {
 					__atomic_fetch_add(&errmetrics, 1, 0);
@@ -404,7 +434,11 @@ void listener_loop(void *userdata)
 
 				double val = atof(value);
 				unsigned long long tm = strtoull(time, NULL, 10);
-				add_point(map, key, val, tm, 1);
+				unsigned int cnt = 1;
+				if (count) {
+					cnt = strtoul(count, NULL, 10);
+				}
+				add_point(map, key, val, tm, cnt);
 			}
 		}
 	}
@@ -422,7 +456,7 @@ int main(int argc, char *argv[])
 	int c, i;
 	int errflg = 0;
 
-	while ((c = getopt(argc, argv, "hl:r:s:w:i:t")) != -1) {
+	while ((c = getopt(argc, argv, "hl:r:s:w:i:tc")) != -1) {
 		switch(c) {
 			case 'l':
 				listen_addr_str = optarg;
@@ -450,6 +484,9 @@ int main(int argc, char *argv[])
 			case 't':
 				use_tcp = 1;
 				break;
+			case 'c':
+				cascade = 1;
+				break;
 			case 'h':
 				errflg++;
 				break;
@@ -466,17 +503,20 @@ int main(int argc, char *argv[])
 		fprintf(stderr, PROGNAME"\n\
 usage: %s options\n\
   -i int\n\
-    	Interval is seconds between aggregate data dump (default %d)\n\
+        Interval is seconds between aggregate data dump (default %d)\n\
   -l string\n\
-    	Listen on udp host:port (default \"%s\")\n\
+        Listen on udp host:port (default \"%s\")\n\
   -r string\n\
-    	Send to host:port (default \"%s\")\n\
+        Send to host:port (default \"%s\")\n\
   -s string\n\
-    	Listen for stat on tcp host:port\n\
+        Listen for stat on tcp host:port\n\
   -w int\n\
-    	Number of workers (default %d)\n\
+        Number of workers (default %d)\n\
   -t\n\
-    	Use TCP outbound connection (default UDP)\n",
+        Use TCP outbound connection (default UDP)\n\
+  -c\n\
+        Cascade mode, intermediate aggregate and send metrics sum and count\n\
+",
 		progname, interval, listen_addr_str, remote_addr_str, thread_num);
 		exit(EXIT_FAILURE);
 	}
