@@ -22,7 +22,7 @@
 #define MAX_MSG 64
 #define STQUEUE_MAX 64
 
-#define PROGNAME "ccarbyne v0.3"
+#define PROGNAME "ccarbyne v0.4"
 #define RCVBUF_SIZE (1024*1024)
 #define SNDBUF_SIZE (256*1024)
 
