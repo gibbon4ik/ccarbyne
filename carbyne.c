@@ -69,6 +69,7 @@ struct net_addr remote_addr;
 int interval = 60;
 uint8_t use_tcp = 0;
 uint8_t cascade = 0;
+uint8_t replace_time = 0;
 int carbon_timeout = 3;
 
 volatile uint64_t getmetrics = 0;
@@ -286,6 +287,7 @@ void dumper(struct st *st, struct obuf *o)
 
 	h = st->h;
 	all->tm = 0;
+	unsigned long long tstamp = (time(NULL) / interval) * interval;
 
 	mh_foreach(_pt, h, i) {
 		struct point *pt = mh_pt_value(h, i);
@@ -296,7 +298,12 @@ void dumper(struct st *st, struct obuf *o)
 			continue;
 		}
 
-		pt->tm /= pt->count;
+		if (replace_time) {
+			pt->tm = tstamp;
+		}
+		else {
+			pt->tm /= pt->count;
+		}
 
 		if (strstr(pt->key, ".count.") != NULL) {
 			xmit_value(o, pt->key, pt->value, pt->tm);
@@ -357,7 +364,7 @@ void aggregator_loop(void *userdata) {
 	time_t nextdump = (time(NULL) / interval) * interval + interval;
 	struct timespec tv;
 	// delay dump by 0.01s
-	long   dumpdelay = cascade ? 0 : 1e7;
+	long   dumpdelay = cascade ? 1e4 : 1e7;
 
 	while (1) {
 		st = stq_pop();
@@ -456,7 +463,7 @@ int main(int argc, char *argv[])
 	int c, i;
 	int errflg = 0;
 
-	while ((c = getopt(argc, argv, "hl:r:s:w:i:tc")) != -1) {
+	while ((c = getopt(argc, argv, "hl:r:s:w:i:tcf")) != -1) {
 		switch(c) {
 			case 'l':
 				listen_addr_str = optarg;
@@ -487,6 +494,9 @@ int main(int argc, char *argv[])
 			case 'c':
 				cascade = 1;
 				break;
+			case 'f':
+				replace_time = 1;
+				break;
 			case 'h':
 				errflg++;
 				break;
@@ -497,11 +507,14 @@ int main(int argc, char *argv[])
 			case '?':
 				ERRORF("Unrecognized option: '-%c'\n", optopt);
 				errflg++;
+				break;
 		}
 	}
 	if (errflg) {
 		fprintf(stderr, PROGNAME"\n\
 usage: %s options\n\
+  -h\n\
+        Show thist help\n\
   -i int\n\
         Interval is seconds between aggregate data dump (default %d)\n\
   -l string\n\
@@ -516,6 +529,8 @@ usage: %s options\n\
         Use TCP outbound connection (default UDP)\n\
   -c\n\
         Cascade mode, intermediate aggregate and send metrics sum and count\n\
+  -f\n\
+        Force metric timestamps to interval start\n\
 ",
 		progname, interval, listen_addr_str, remote_addr_str, thread_num);
 		exit(EXIT_FAILURE);
