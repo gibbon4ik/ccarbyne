@@ -466,7 +466,7 @@ int main(int argc, char *argv[])
 	int c, i;
 	int errflg = 0;
 
-	while ((c = getopt(argc, argv, "hl:r:s:w:i:tcf")) != -1) {
+	while ((c = getopt(argc, argv, "hl:r:s:w:i:tcfa")) != -1) {
 		switch(c) {
 			case 'l':
 				listen_addr_str = optarg;
