@@ -22,7 +22,7 @@
 #define MAX_MSG 64
 #define STQUEUE_MAX 64
 
-#define PROGNAME "ccarbyne v0.4"
+#define PROGNAME "ccarbyne v0.5"
 #define RCVBUF_SIZE (1024*1024)
 #define SNDBUF_SIZE (256*1024)
 
@@ -69,6 +69,7 @@ struct net_addr remote_addr;
 int interval = 60;
 uint8_t use_tcp = 0;
 uint8_t cascade = 0;
+uint8_t countall = 0;
 uint8_t replace_time = 0;
 int carbon_timeout = 3;
 
@@ -309,10 +310,12 @@ void dumper(struct st *st, struct obuf *o)
 			xmit_value(o, pt->key, pt->value, pt->tm);
 			__atomic_fetch_add(&sendmetrics, 1, 0);
 			strcpy(kbuf, pt->key);
-			char *rpoint = strrchr(kbuf, '.');
-			if (rpoint) {
-				strcpy(rpoint, ".all");
-				add_point(all, kbuf, pt->value, pt->tm, 1);
+			if (countall) {
+				char *rpoint = strrchr(kbuf, '.');
+				if (rpoint) {
+					strcpy(rpoint, ".all");
+					add_point(all, kbuf, pt->value, pt->tm, 1);
+				}
 			}
 		}
 		if (strstr(pt->key, ".avg.") != NULL) {
@@ -497,6 +500,9 @@ int main(int argc, char *argv[])
 			case 'f':
 				replace_time = 1;
 				break;
+			case 'a':
+				countall = 1;
+				break;
 			case 'h':
 				errflg++;
 				break;
@@ -531,6 +537,8 @@ usage: %s options\n\
         Cascade mode, intermediate aggregate and send metrics sum and count\n\
   -f\n\
         Force metric timestamps to interval start\n\
+  -a\n\
+        Add 'all' for count merics\n\
 ",
 		progname, interval, listen_addr_str, remote_addr_str, thread_num);
 		exit(EXIT_FAILURE);
