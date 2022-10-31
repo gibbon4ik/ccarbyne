@@ -22,14 +22,14 @@
 #define MAX_MSG 64
 #define STQUEUE_MAX 64
 
-#define PROGNAME "ccarbyne v0.5"
+#define PROGNAME "ccarbyne v0.6"
 #define RCVBUF_SIZE (1024*1024)
 #define SNDBUF_SIZE (256*1024)
 
 struct state {
 	int fd;
 	struct mmsghdr messages[MAX_MSG];
-	char buffers[MAX_MSG][MTU_SIZE];
+	char buffers[MAX_MSG][MTU_SIZE+1];
 	struct iovec iovecs[MAX_MSG];
 };
 
@@ -65,6 +65,9 @@ pthread_mutex_t qlock;
 
 struct net_addr listen_addr;
 struct net_addr remote_addr;
+
+const char *listen_addr_str = "127.0.0.1:2023";
+const char *remote_addr_str = "127.0.0.1:2003";
 
 int interval = 60;
 uint8_t use_tcp = 0;
@@ -226,7 +229,7 @@ void flush(struct obuf *o)
 		int r = send(o->fd, ptr, o->len, 0);
 		if (r < 0) {
 			if (errno == EINTR || errno == EAGAIN) {
-				usleep(1000);
+				usleep(100);
 				continue;
 			}
 			if (use_tcp) {
@@ -279,6 +282,9 @@ again:
 char kbuf[520];
 void dumper(struct st *st, struct obuf *o)
 {
+#ifdef DEBUG
+	printf("send aggregated from %s\n", listen_addr_str);
+#endif
 	struct st *all = st_create();
 	struct mh_pt_t *h;
 	if (o->fd < 0) {
@@ -309,8 +315,8 @@ void dumper(struct st *st, struct obuf *o)
 		if (strstr(pt->key, ".count.") != NULL) {
 			xmit_value(o, pt->key, pt->value, pt->tm);
 			__atomic_fetch_add(&sendmetrics, 1, 0);
-			strcpy(kbuf, pt->key);
 			if (countall) {
+				strcpy(kbuf, pt->key);
 				char *rpoint = strrchr(kbuf, '.');
 				if (rpoint) {
 					strcpy(rpoint, ".all");
@@ -366,14 +372,14 @@ void aggregator_loop(void *userdata) {
 	total = st_create();
 	time_t nextdump = (time(NULL) / interval) * interval + interval;
 	struct timespec tv;
-	// delay dump by 0.01s
-	long   dumpdelay = cascade ? 1e4 : 1e7;
+	// delay dump by 0.01s for sure all data aggregated
+	// random dump delay for cascade aggregators spread packets by time
+	long   dumpdelay = cascade ? 1000 + (rand() % 10000) : 10000000;
 
 	while (1) {
 		st = stq_pop();
 		if (st == NULL) {
 			clock_gettime(CLOCK_REALTIME, &tv);
-			// delay dump by 0.01s
 			if (tv.tv_sec > nextdump || (tv.tv_sec == nextdump && tv.tv_nsec >= dumpdelay)) {
 				nextdump += interval;
 				dumper(total, o);
@@ -398,11 +404,15 @@ void listener_loop(void *userdata)
 {
 	struct state *state = userdata;
 	struct st *map = st_create();
-	struct timespec timeout = { .tv_sec = 1, .tv_nsec = 0 };
-	time_t nextsec = time(NULL) + 1;
+	struct timespec timeout = { .tv_sec = 0, .tv_nsec = 1e8 };
+	struct timespec tv;
+	time_t nextsec = time(NULL) + cascade? 0 : 1;
+	long   dumpdelay = cascade ? 999000000 : 1000000;
+
 
 	while (1) {
-		if (time(NULL) >= nextsec) {
+		clock_gettime(CLOCK_REALTIME, &tv);
+		if (tv.tv_sec > nextsec || (tv.tv_sec == nextsec && tv.tv_nsec >= dumpdelay)) {
 			nextsec += 1;
 			if (stq_push(map))
 				map = st_create();
@@ -417,17 +427,13 @@ void listener_loop(void *userdata)
 			PFATAL("recvmmsg()");
 		}
 
-		int i, bytes = 0;
+		int i;
 		for (i = 0; i < r; i++) {
 			struct mmsghdr *msg = &state->messages[i];
-			int len = msg->msg_len;
-			msg->msg_hdr.msg_flags = 0;
-			msg->msg_len = 0;
-			bytes += len;
 			char *buf = msg->msg_hdr.msg_iov->iov_base;
 			char *line, *save1, *save2;
 
-			buf[len] = 0;
+			buf[msg->msg_len] = 0;
 			for (save1 = NULL, line = strtok_r(buf, "\n", &save1); line; line = strtok_r(NULL, "\n", &save1)) {
 				save2 = NULL;
 				char *key = strtok_r(line, " ", &save2);
@@ -456,8 +462,6 @@ void listener_loop(void *userdata)
 
 int main(int argc, char *argv[])
 {
-	const char *listen_addr_str = "127.0.0.1:2023";
-	const char *remote_addr_str = "127.0.0.1:2003";
 	const char *stat_addr_str = NULL;
 	struct net_addr stat_addr;
 	int stat_fd = -1;
@@ -466,6 +470,7 @@ int main(int argc, char *argv[])
 	int c, i;
 	int errflg = 0;
 
+	srand(time(NULL));
 	while ((c = getopt(argc, argv, "hl:r:s:w:i:tcfa")) != -1) {
 		switch(c) {
 			case 'l':
@@ -520,7 +525,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, PROGNAME"\n\
 usage: %s options\n\
   -h\n\
-        Show thist help\n\
+        Show this help\n\
   -i int\n\
         Interval is seconds between aggregate data dump (default %d)\n\
   -l string\n\
