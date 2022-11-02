@@ -22,7 +22,7 @@ sub END {
 my $recive = '127.0.0.1:2003';
 # send metrics to
 my $sendto = '127.0.0.1:2023';
-my $interval = 30;
+my $interval = 60;
 my $startport = 2100;
 my $cagg = 10;
 
@@ -32,6 +32,7 @@ my @metrics = qw(
     level3.level2.test1 level3.level2.test2 level3.level2.test3
 );
 #@metrics = qw(level1);
+
 
 my ($graphitehost, $graphiteport) = split /:/, $sendto;
 my $sock = _connect($graphitehost, $graphiteport);
@@ -47,7 +48,7 @@ unless ($recvpid) {
     while ($rsock->recv($newmsg, 1420)) {
         my($port, $ipaddr) = sockaddr_in($rsock->peername);
         #$hishost = gethostbyaddr($ipaddr, AF_INET);
-        print "time=",time(),"\n";
+        print "time=",Time::HiRes::time(),"\n";
         print "$newmsg\n";
     }
     exit;
@@ -58,7 +59,7 @@ push @pids, $recvpid;
 my $agpid = fork();
 die "aggregator fork() failed: $!" unless defined $agpid;
 unless ($agpid) {
-    exec("./ccarbyne -i $interval -w 10 -f -l $sendto -r $recive");
+    exec("./ccarbyne -i $interval -w 4 -f -l $sendto -r $recive");
 }
 push @pids, $agpid;
 
@@ -70,7 +71,7 @@ for (my $i=0; $i<$cagg; $i++) {
     my $cagpid = fork();
     die "caggregator fork() failed: $!" unless defined $cagpid;
     unless ($cagpid) {
-        exec("./ccarbyne -i $interval -w 2 -c -l $ip:$port -r $sendto");
+        exec("./ccarbyne -i 100 -w 2 -c -l $ip:$port -r $sendto");
     }
     push @pids, $cagpid;
     $sockets{$port} = _connect($ip, $port);
@@ -81,13 +82,15 @@ $SIG{TERM} = \&killall;
 my $sttime = int(time() / $interval) * $interval;
 my $count = 0;
 my $skip = 0;
+
+my %bulk;
+for (@metrics) {
+    $bulk{'count.'.$_} = 1;
+}
+
 while(1) {
     my $t = time() - $sttime;
     if ($t < $interval * 1) {
-        my %bulk;
-        for (@metrics) {
-            $bulk{'count.'.$_} = 1;
-        }
         _sendbulk($sock,\%bulk);
         my $port = int(rand($cagg))+$startport;
         _sendbulk($sockets{$port},\%bulk,'cascade');
