@@ -24,7 +24,7 @@ my $recive = '127.0.0.1:2003';
 my $sendto = '127.0.0.1:2023';
 my $interval = 60;
 my $startport = 2100;
-my $cagg = 10;
+my $cagg = 5;
 
 my @metrics = qw(
     level1
@@ -59,7 +59,8 @@ push @pids, $recvpid;
 my $agpid = fork();
 die "aggregator fork() failed: $!" unless defined $agpid;
 unless ($agpid) {
-    exec("./ccarbyne -i $interval -w 4 -f -l $sendto -r $recive");
+    my $command = "./ccarbyne -i $interval -w 4 -f -s 127.0.0.1:2000 -l $sendto -r $recive";
+    exec($command);
 }
 push @pids, $agpid;
 
@@ -71,7 +72,8 @@ for (my $i=0; $i<$cagg; $i++) {
     my $cagpid = fork();
     die "caggregator fork() failed: $!" unless defined $cagpid;
     unless ($cagpid) {
-        exec("./ccarbyne -i 100 -w 2 -c -l $ip:$port -r $sendto");
+        my $command = "./ccarbyne -i $interval -w 2 -c -l $ip:$port -r $sendto";
+        exec($command);
     }
     push @pids, $cagpid;
     $sockets{$port} = _connect($ip, $port);
@@ -101,7 +103,7 @@ while(1) {
         $count = 0;
         $sttime = int(time() / $interval) * $interval;
     }
-    Time::HiRes::sleep(1e-4);
+    Time::HiRes::sleep(1e-5);
 }
 
 kill 'TERM', @pids;

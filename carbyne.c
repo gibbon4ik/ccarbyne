@@ -22,7 +22,7 @@
 #define MAX_MSG 64
 #define STQUEUE_MAX 64
 
-#define PROGNAME "ccarbyne v0.7"
+#define PROGNAME "ccarbyne v0.8"
 #define RCVBUF_SIZE (1024*1024)
 #define SNDBUF_SIZE (256*1024)
 #define NANOSEC_IN_SEC 1000000000L
@@ -69,7 +69,9 @@ struct net_addr remote_addr;
 const char *listen_addr_str = "127.0.0.1:2023";
 const char *remote_addr_str = "127.0.0.1:2003";
 
-int interval = 60;
+double interval = 60.0;
+struct timespec tv_interval;
+
 uint8_t use_tcp = 0;
 uint8_t cascade = 0;
 uint8_t countall = 0;
@@ -128,14 +130,14 @@ struct st *stq_pop()
 
 /***************************************************************************/
 
-void addtime(struct timespec *accumulator, struct timespec *interval)
+void addtime(struct timespec *accumulator, struct timespec *step)
 {
-	accumulator->tv_nsec += interval->tv_nsec;
+	accumulator->tv_nsec += step->tv_nsec;
 	if (accumulator->tv_nsec >= NANOSEC_IN_SEC) {
 		accumulator->tv_nsec -= NANOSEC_IN_SEC;
 		accumulator->tv_sec++;
 	}
-	accumulator->tv_sec += interval->tv_sec;
+	accumulator->tv_sec += step->tv_sec;
 }
 
 bool itstime(struct timespec *time)
@@ -145,6 +147,12 @@ bool itstime(struct timespec *time)
 	if (tv.tv_sec > time->tv_sec || (tv.tv_sec == time->tv_sec && tv.tv_nsec >= time->tv_nsec))
 		return 1;
 	return 0;
+}
+
+void double2tv(double t, struct timespec *tv)
+{
+	tv->tv_sec = (time_t)t;
+	tv->tv_nsec = (long)((t - tv->tv_sec) * 1e9);
 }
 
 void add_point(struct st *st, char *key, double value, unsigned long long tm, unsigned int count)
@@ -272,7 +280,7 @@ void xmit_value(struct obuf *o, const char *metric, double value, unsigned long 
 	int r = 0;
 again:
 	r = snprintf(o->buf + o->len, packet_len - o->len + 1,
-		     "%s %f %llu\n",
+		     "%s %g %llu\n",
 		     metric, value, tm);
 
 	assert(r < CARBON_LEN);
@@ -289,7 +297,7 @@ void xmit_cascade(struct obuf *o, const char *metric, double sum, unsigned int c
 	int r = 0;
 again:
 	r = snprintf(o->buf + o->len, packet_len - o->len + 1,
-		     "%s %f %llu %u\n",
+		     "%s %g %llu %u\n",
 		     metric, sum, tm, count);
 
 	assert(r < CARBON_LEN);
@@ -317,8 +325,7 @@ void dumper(struct st *st, struct obuf *o)
 	all->tm = 0;
 	if (replace_time) {
 		clock_gettime(CLOCK_REALTIME, &tv);
-		tstamp = (tv.tv_sec / interval) * interval;
-		printf("time %ld.%09ld round to %lld\n", tv.tv_sec, tv.tv_nsec, tstamp);
+		tstamp = (tv.tv_sec / tv_interval.tv_sec) * tv_interval.tv_sec;
 	}
 
 	mh_foreach(_pt, h, i) {
@@ -390,31 +397,37 @@ void aggregator_loop(void *userdata) {
 	struct st *st;
 	struct mh_pt_t *h;
 	bool force_dump = 0;
-	// delay dump by 5ms for sure all data aggregated
+	// delay dump 200ms
 	struct timespec nextdump = {
-	       .tv_sec = (time(NULL) / interval) * interval + interval,
-	       .tv_nsec = 5000000L
+	       .tv_sec = time(NULL),
+	       .tv_nsec = 200000000L
 	};
+	if (tv_interval.tv_sec != 0)
+		nextdump.tv_sec = (time(NULL) / tv_interval.tv_sec) * tv_interval.tv_sec + tv_interval.tv_sec;
 
 	struct obuf *o = malloc(sizeof(*o));
 	o->fd  = - 1;
 	o->len = 0;
 
 	total = st_create();
+	int count = 0;
 
 	while (1) {
 		st = stq_pop();
 		if (st == NULL) {
 			if (itstime(&nextdump)) {
-				nextdump.tv_sec += interval;
+				addtime(&nextdump, &tv_interval);
 				force_dump = 1;
 			}
 			if (force_dump) {
-				dumper(total, o);
-				total = st_create();
+				if (count) {
+					dumper(total, o);
+					total = st_create();
+					count = 0;
+				}
 				force_dump = 0;
 			}
-			usleep(500);
+			usleep(1000);
 			continue;
 		}
 		h = st->h;
@@ -423,6 +436,8 @@ void aggregator_loop(void *userdata) {
 			add_point(total, pt->key, pt->value, pt->tm, pt->count);
 		}
 		st_destroy(st);
+		count++;
+		// in cascade mode send data immediate
 		if (cascade)
 			force_dump = 1;
 	}
@@ -435,11 +450,13 @@ void listener_loop(void *userdata)
 	struct state *state = userdata;
 	struct st *map = st_create();
 	struct timespec	timestep = { .tv_sec = 1, .tv_nsec = 0 };
-	struct timespec nextpush = { .tv_sec = time(NULL) - 1, .tv_nsec = 99900000L };
-	// in cascade mode send values every interval ms, interval set by option -i
+	struct timespec nextpush = { .tv_sec = time(NULL), .tv_nsec = 0 };
 	if (cascade) {
-		timestep.tv_sec = 0;
-		timestep.tv_nsec = interval * 1000000L;
+		if (tv_interval.tv_sec > 1) {
+			nextpush.tv_sec = (time(NULL) / tv_interval.tv_sec) * tv_interval.tv_sec - 1;
+			nextpush.tv_nsec = 800000000L + rand() % 100000000;
+		}
+		timestep = tv_interval;
 	}
 	addtime(&nextpush, &timestep);
 
@@ -452,7 +469,7 @@ void listener_loop(void *userdata)
 		}
 
 		/* Blocking recv. */
-		int r = recvmmsg(state->fd, &state->messages[0], MAX_MSG, MSG_WAITFORONE, NULL);
+		int r = recvmmsg(state->fd, &state->messages[0], MAX_MSG, 0, NULL);
 		if (r <= 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 				continue;
@@ -502,6 +519,7 @@ int main(int argc, char *argv[])
 	char *progname = argv[0];
 	int c, i;
 	int errflg = 0;
+	srand(time(NULL));
 
 	while ((c = getopt(argc, argv, "hl:r:s:w:i:tcfa")) != -1) {
 		switch(c) {
@@ -522,9 +540,9 @@ int main(int argc, char *argv[])
 				}
 				break;
 			case 'i':
-				interval = atoi(optarg);
-				if (interval < 1 || interval > 300) {
-					ERRORF("interval must between 1 and 300\n");
+				interval = atof(optarg);
+				if (interval < 0.001 || interval > 300.0) {
+					ERRORF("interval must between 0.001 and 300\n");
 					errflg++;
 				}
 				break;
@@ -559,7 +577,7 @@ usage: %s options\n\
   -h\n\
         Show this help\n\
   -i int\n\
-        Interval is seconds between aggregate data dump (default %d)\n\
+        Interval is seconds between aggregate data dump (default %g)\n\
   -l string\n\
         Listen on udp host:port (default \"%s\")\n\
   -r string\n\
@@ -580,6 +598,14 @@ usage: %s options\n\
 		progname, interval, listen_addr_str, remote_addr_str, thread_num);
 		exit(EXIT_FAILURE);
 	}
+
+	if (!cascade && interval < 1.0) {
+		fprintf(stderr, PROGNAME"\n\
+Interval less than 1s is only allowed in cascade mode\n");
+		exit(EXIT_FAILURE);
+	}
+
+	double2tv(interval, &tv_interval);
 
 	parse_addr(&listen_addr, listen_addr_str);
 	parse_addr(&remote_addr, remote_addr_str);
@@ -652,7 +678,7 @@ usage: %s options\n\
 						ERRORF("statistic connect accept error\n");
 					}
 					else {
-						int len = sprintf(buffer, "metrics\t%lu\nerrors\t%lu\nsend\t%lu\n",
+						int len = snprintf(buffer, sizeof(buffer), "metrics\t%lu\nerrors\t%lu\nsend\t%lu\n",
 								__atomic_load_n(&getmetrics, 0),
 								__atomic_load_n(&errmetrics, 0),
 								__atomic_load_n(&sendmetrics, 0));
@@ -667,11 +693,6 @@ usage: %s options\n\
 		}
 	}
 
-	/*	
-	for (t = 0; t < thread_num; t++) {
-		struct state *state = &array_of_states[t];
-	}
-	*/
 	pthread_mutex_destroy(&plock);
 	pthread_mutex_destroy(&qlock);
 	return 0;

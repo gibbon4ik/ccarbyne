@@ -143,8 +143,8 @@ int net_bind_udp(struct net_addr *shost, int reuseport)
 		PFATAL("setsockopt(SO_REUSEADDR)");
 	}
 
-	// set socket recive timeout 0.2s
-	struct timeval timeout = { .tv_sec = 0, .tv_usec = 200000 };
+	// set socket recive timeout 50ms
+	struct timeval timeout = { .tv_sec = 0, .tv_usec = 50000 };
 	r = setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
 			   sizeof(timeout));
 	if (r < 0) {

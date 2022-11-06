@@ -1,5 +1,5 @@
 CC=gcc
-override CFLAGS += -O2 -Wall -Wextra -Wno-unused-parameter -pthread
+CFLAGS+=-O2 -Wall -Wextra -Wno-unused-parameter -pthread
 #CFLAGS+=-ggdb -g
 LDFLAGS=
 SOURCES=carbyne.c net.c murmur_hash2.c palloc.c
